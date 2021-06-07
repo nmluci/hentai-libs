@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import os
+import sys
+import requests
+import time
+import json
+import re
+from bs4 import BeautifulSoup
 from typing import List
 from urllib.parse import urljoin, unquote
 from dataclasses import dataclass
 from enum import Enum, unique
-import requests
-from datetime import datetime, timezone
-
-from requests.api import get
+from fake_useragent import UserAgent
+from datetime import datetime
 
 @unique
 class Extensions(Enum):
@@ -17,15 +22,12 @@ class Extensions(Enum):
 
 @unique
 class TagOption(Enum):
-    Raw = "raw"
     Lang = "language"
-    Char = "characters"
+    Char = "character"
     Tags = "tag"
     Artist = "artist"
     Parody = "parody"
     Group = "group"
-
-    all: List[TagOption] = lambda: [option for option in TagOption if option.value != "raw"]
 
 @unique
 class Sort(Enum):
@@ -51,11 +53,11 @@ class Tag:
     count: int
 
     @classmethod
-    def getTags(cls, tags: List[Tag], property_: str) -> str:
+    def getTags(cls, tags: List[Tag], opt: TagOption) -> str:            
         try:
-            return ", ".join([tag.name for tag in tags if tag.type == property_])
+            return ", ".join([tag.name for tag in tags if tag.type == opt.value])
         except Exception:
-            return " "
+            return None
 
 @dataclass(frozen=True)
 class Page:
@@ -84,10 +86,10 @@ class Book:
         self.scanlator = data["scanlator"]
         self.uploaded = datetime.fromtimestamp(data["upload_date"]).strftime('%Y-%m-%d %H:%M:%S')
         self.epoch = data["upload_date"]
-        
+
         self.rawTag = [self.__parseTags__(tag) for tag in data["tags"]] 
-        self.character = Tag.getTags(self.rawTag, "characters")
-        self.tags = Tag.getTags(self.rawTag, "tag")
+        self.character = Tag.getTags(self.rawTag, TagOption.Char)
+        self.tags = Tag.getTags(self.rawTag, TagOption.Tags)
 
         self.pages = [
             self.__parsePage__(self.media_id, num, **_) for num, _ in enumerate(images["pages"], start=1)
@@ -121,6 +123,9 @@ class Hentai:
     def __init__(self):
         self.module = "nh"
         self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": UserAgent().chrome
+        })
         self.APIurl = "https://nhentai.net/api/"
         self.HOMEurl = "https://nhentai.net/"
 
@@ -130,15 +135,31 @@ class Hentai:
             params=params
         ).json()
 
-    def search(self, query: str, page: int=1, sort_by: str="date") -> List[Book]:
+    def search(self, query: str, page: int=1, sort_by: Sort = Sort.Date) -> List[Book]:
         res = self.__getUrl("galleries/search",
             params={
                 "query": query,
                 "page": page,
                 "sort": sort_by
-            })["result"]
-        return [Book(data) for data in res]
+            })
+        return [Book(data) for data in res['result']]
     
+    def searchFallback(self, query, page: int=1, sort_by: Sort = Sort.Date) -> List[Book]:
+        res = self.session.get(urljoin(self.HOMEurl, "search/"), 
+            params={
+                "q": query,
+                "page": page
+            })
+        
+        book = []
+        soup = BeautifulSoup(res.content.decode("UTF-8"), "html.parser")
+        soup = soup.find_all("a", href=True)
+        
+        for link in soup:
+            regex = re.findall("\/g\/\d+\/", str(link))
+            if regex: book.append(self.getDoujin(int(regex[0].split("/")[2])))
+        return book
+
     def getDoujin(self, id: int) -> Book:
         try: 
             return Book(self.__getUrl(f"gallery/{id}"))
@@ -151,14 +172,57 @@ class Hentai:
         ).headers["Location"][3:-1]
         return self.getDoujin(int(nukeid))
     
-    def search(self, query: str, page: int=1, sort_by: str="date") -> List[Book]:
-        books = self.__getUrl('galleries/search', {
-            "query": query,
-            "page": page,
-            "sort": sort_by
-        })['result']
-        return [Book(res) for res in books]
 
     def related(self, id: int):
         books = self.__getUrl(f"gallery/{id}/related")["result"]
         return [Book(relate) for relate in books]
+
+    def searchAllQuery(self, query: str, sort: Sort= Sort.Date) -> List[Book]:
+        data = []
+        payload = {'query': query, 'page': 1, "sort": sort.value}
+        res = self.__getUrl('galleries/search', params=payload)
+
+        for page in range(1, int(res["num_pages"])):
+            try:
+                buff = self.search(query, page, sort)
+                data.extend(buff)
+            except KeyError:
+                try:
+                    buff = self.searchFallback(query, page, sort)
+                    data.extend(buff)
+                except Exception as e:
+                    print(f"{page=} {e=}")
+                    continue
+
+            with open("zasauce.schdata", "a+", encoding="UTF-8") as nuke:
+                for doujin in buff:
+                    nuke.write(f"{doujin.id} => {doujin.title.pretty}\n")
+            time.sleep(.1)
+        return data
+
+    def download(self, doujin: Book):
+        urls = Page.getUrls(doujin.pages)
+        baseFolder = "Doujin"
+        for url in urls:
+            try:
+                response = self.session.head(url)
+
+                if response.status_code == 200:
+                    fSize = int(response.headers.get("Content-Length"))
+                    if fSize == None: fSize = 1
+                    response = self.session.get(url, stream=True)
+                    filename = os.path.join(url.split("/")[len(url.split("/"))-1])
+                    dlPath = os.path.join(baseFolder, str(doujin.id))
+                    if not os.path.isdir(dlPath):
+                        os.makedirs(dlPath)
+
+                    filename = os.path.join(dlPath, filename)
+
+                    if os.path.isfile(filename) and os.stat(dlPath).st_size == fSize:
+                        pass
+                    else:
+                        with open(filename, "wb") as file:
+                            for chunk in response.iter_content(1024):
+                                file.write(chunk)
+            except Exception as e:
+                print(f"Error {e}")

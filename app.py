@@ -1,5 +1,5 @@
-from libs.hentai import Hentai
+from libs.hentai import Book, Hentai, Tag, TagOption
 
 nh = Hentai()
-book = nh.random()
-print(f"{book.title.pretty=}\n{book.tags=}\n{book.character=}\n{book.num_pages=}")
+book = nh.getDoujin(178348)
+nh.download(book)
